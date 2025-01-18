@@ -1,0 +1,111 @@
+#!/bin/bash
+
+. /lib/functions.sh
+
+/sbin/hotplug-call ipsec "$1"
+PATH="/sbin:/bin:/usr/sbin:/usr/bin:/usr/sbin"
+export PATH
+
+debug_updown(){
+	echo "IPSsec-UPDOWN: $@" > /dev/console
+}
+
+case "$PLUTO_VERB:$1" in
+up-host: | up-client: | up-host-v6: | up-client-v6: )
+				
+	TUNNEL_NAME=$( echo "$PLUTO_CONNECTION" | cut -d\_ -f1 )
+
+	uci set ipsecInfo.$TUNNEL_NAME.connected=1
+    uci set ipsecInfo.$TUNNEL_NAME.uptime_connected=1
+	uci set ipsecInfo.$TUNNEL_NAME.localinterface=$PLUTO_INTERFACE
+	uci set ipsecInfo.$TUNNEL_NAME.localpeer=$PLUTO_ME
+	uci set ipsecInfo.$TUNNEL_NAME.remotepeer=$PLUTO_PEER
+	uci add_list ipsecInfo.$TUNNEL_NAME.localnetwork=$PLUTO_MY_CLIENT
+	uci add_list ipsecInfo.$TUNNEL_NAME.remotenetwork=$PLUTO_PEER_CLIENT
+	uci add_list ipsecInfo.$TUNNEL_NAME.childsa=$PLUTO_CONNECTION
+	uci commit ipsecInfo
+
+	uci set ipsecStatus.$TUNNEL_NAME.connected=1
+    uci set ipsecStatus.$TUNNEL_NAME.uptime_connected=1
+    uci commit ipsecStatus
+
+	debug_updown ""
+	debug_updown "$PLUTO_CONNECTION: UP-CLIENT"
+	debug_updown "$PLUTO_CONNECTION: INTERFACE $PLUTO_INTERFACE, CONNECTION $TUNNEL_NAME"
+	debug_updown "$PLUTO_CONNECTION: ME $PLUTO_ME, PEER $PLUTO_PEER"
+	debug_updown "$PLUTO_CONNECTION: MY PORT $PLUTO_MY_PORT, PEER PORT $PLUTO_PEER_PORT"
+	debug_updown "$PLUTO_CONNECTION: MY PROTOCOL $PLUTO_MY_PROTOCOL, PEER PROTOCOL $PLUTO_PEER_PROTOCOL"
+	debug_updown "$PLUTO_CONNECTION: MY CLIENT $PLUTO_MY_CLIENT, PEER CLIENT $PLUTO_PEER_CLIENT"
+	debug_updown "$PLUTO_CONNECTION: MY SOURCE IP $PLUTO_MY_SOURCEIP, PEER SOURCE IP $PLUTO_PEER_SOURCEIP"
+	debug_updown "$PLUTO_CONNECTION: MY ID $PLUTO_MY_ID PEER ID $PLUTO_PEER_ID"
+	debug_updown "$PLUTO_CONNECTION: REQUIRED ID $PLUTO_REQID NEGOTIATED $PLUTO_PROTO"
+	debug_updown "$PLUTO_CONNECTION: IPCOMP $PLUTO_IPCOMP UNIQUE IDENTIFIER $PLUTO_UNIQUEID"
+				
+	logger -t IPSEC "IPsec connection '$PLUTO_CONNECTION' is up."
+
+	#for local peer if main tunnel is open close backup connection
+	child_cnt=$( uci -q -d $'\n' get ipsecInfo.$TUNNEL_NAME.childsa | grep -c "[A-Za-z]" )
+	# debug_updown "child_cnt=$child_cnt"
+	[ $child_cnt -eq 1 ] && {
+		is_local=$( uci -q get ipsec.$TUNNEL_NAME.peer_mode )
+		operation_mode=$( uci -q get ipsec.$TUNNEL_NAME.operation_mode )
+		[ "$is_local" = "local" ] && [ "$operation_mode" = "main" ] && {
+				backup_tunnel=$( uci show ipsec | grep "backup_reference" | grep -w "$TUNNEL_NAME" | cut -d '.' -f2 )
+				is_open=$( uci -q get ipsecInfo.$backup_tunnel.active )
+				[ -n "$backup_tunnel" ] && [ "$is_open" = "1" ] && {
+					pid=$( pgrep -fx '/bin/bash /etc/swanctl/ipsec_functions shift_tunnel DW "$backup_tunnel"' )
+					# debug "pid=$pid"
+					[ -n "$pid" ] && kill -9 $pid
+					/etc/swanctl/ipsec_functions "shift_tunnel" "DW" "$backup_tunnel" 2>&1 <&1 & disown
+				}
+		}
+
+		processId=$(ps | grep '/etc/swanctl/ipsec_uptime' | grep -v 'grep' | awk '{ printf $1 }')
+		[ -z "$processId" ] && {
+			/etc/swanctl/ipsec_uptime 0<&- &>/dev/null &
+		}
+		/etc/swanctl/ipsec_functions ipsec_led 2>/dev/null & disown
+	}
+	;;
+
+down-host: | down-client: | down-host-v6: | down-client-v6:)
+
+	TUNNEL_NAME=$( echo "$PLUTO_CONNECTION" | cut -d\_ -f1 )
+
+	debug_updown "$PLUTO_CONNECTION: down-client"
+
+	uci -q del_list ipsecInfo.$TUNNEL_NAME.localnetwork=$PLUTO_MY_CLIENT
+	uci -q del_list ipsecInfo.$TUNNEL_NAME.remotenetwork=$PLUTO_PEER_CLIENT
+	uci -q del_list ipsecInfo.$TUNNEL_NAME.childsa=$PLUTO_CONNECTION
+	uci commit ipsecInfo
+
+	child_cnt=$( uci -q -d $'\n' get ipsecInfo.$TUNNEL_NAME.childsa | grep -c "[A-Za-z]" )
+	[ $child_cnt -eq 0 ] && {
+		debug_updown ""
+		debug_updown "$TUNNEL_NAME: down-client"
+		uci set ipsecInfo.$TUNNEL_NAME.connected=0
+		uci set ipsecInfo.$TUNNEL_NAME.uptime_connected=0
+		uci -q delete ipsecInfo.$TUNNEL_NAME.localinterface
+		uci -q delete ipsecInfo.$TUNNEL_NAME.localpeer
+		uci -q delete ipsecInfo.$TUNNEL_NAME.remotepeer
+		uci -q delete ipsecInfo.$TUNNEL_NAME.remotenetwork
+		uci -q delete ipsecInfo.$TUNNEL_NAME.localnetwork
+		uci commit ipsecInfo
+		uci set ipsecStatus.$TUNNEL_NAME.connected=0
+    	uci set ipsecStatus.$TUNNEL_NAME.uptime_connected=0
+    	uci commit ipsecStatus
+		logger -t IPSEC "IPsec connection '$TUNNEL_NAME' is down."
+		#for local peer if main tunnel is closed then open backup connection
+		is_local=$( uci -q get ipsec.$TUNNEL_NAME.peer_mode )
+		[ "$is_local" = "local" ] && {
+			is_main=$( uci -q get ipsec.$TUNNEL_NAME.operation_mode )
+			[ "$is_main" = "main" ] && /etc/swanctl/ipsec_functions "shift_tunnel" "UP" "$TUNNEL_NAME" 2>&1 <&1 & disown
+		}
+		/etc/swanctl/ipsec_functions ipsec_led 2>/dev/null & disown
+	}
+	;;
+
+*)	echo "$0:) unknown verb \`$PLUTO_VERB' or parameter \`$1'" >&2
+	exit 1
+	;;
+esac

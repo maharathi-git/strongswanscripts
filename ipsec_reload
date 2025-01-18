@@ -1,0 +1,23 @@
+#!/bin/bash
+
+debug() {
+	echo "reload: $*" > /dev/console
+}
+
+while [ true ]
+do
+	do_reload=$( cat /var/run/charon.pid )
+	[ -z "$do_reload" ] && debug "### no charon exit." && exit 0
+
+	do_reload=$( uci -q get ipsecInfo.reload )
+	[ "$do_reload" = "1" ] && {
+		pid=$( pgrep -fx "/bin/bash /etc/init.d/swanctl reload" )
+		debug "$pid reloading IPsec..."
+		[ -n "$pid" ] && continue
+		/etc/init.d/swanctl reload #2>/dev/null & disown
+		debug "$pid reloading done"
+		uci set ipsecInfo.reload=0
+		uci commit ipsecInfo
+	}
+	sleep 10
+done

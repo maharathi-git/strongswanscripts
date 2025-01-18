@@ -1,0 +1,121 @@
+#!/bin/bash
+. $PKG_INSTROOT/lib/functions.sh
+
+uptime_connected=0
+Connected_Time=0
+Total_Time=0
+
+declare -i connected_count=0
+
+debug() {
+	echo "$@" > /dev/console
+}
+
+connected_tunnels() 
+{
+	local section="$1"
+
+	[ -z "$section" ] && return
+
+	connected_count=$( uci -q get ipsecStatus.$1.connected_count )
+	if [ -z "$connected_count" ];then
+		connected_count=0
+	elif [ "$connected_count" = "0" ];then
+		uci set ipsecStatus.$1.Connected_Time="-1"
+		uci set ipsecStatus.$1.Total_Time="0"
+		uci set ipsecStatus.$1.UpTime="00:00:00:00"
+ 	 	uci set ipsecStatus.$1.Total_UpTime="00:00:00:00"
+		uci set ipsecStatus.$1.Previous_Time="0"
+		uci set ipsecStatus.$1.connected_count="0"
+        uci commit ipsecStatus
+	fi
+	uptime_connected=0	
+	uptime_connected=$( uci -q get ipsecStatus.$1.uptime_connected )
+
+	if [ "$uptime_connected" = "1" ]; then
+		Connected_Time=$( uci -q get ipsecStatus.$1.Connected_Time )
+		[ -z "$Connected_Time" ] && Connected_Time=-1
+
+		Total_Time=$( uci -q get ipsecStatus.$1.Total_Time )
+		[ -z "$Total_Time" ] && Total_Time=0
+
+		if [ "$Connected_Time" = "-1" ]; then
+			Connected_Time=0
+			connected_count=$( uci -q get ipsecStatus.$1.connected_count )
+			[ -z "$connected_count" ] && connected_count=0
+
+			((++connected_count))
+
+			uci set ipsecStatus.$1.connected_count="$connected_count"
+			start=$(date +%s)
+			uci set ipsecStatus.$1.Connected_Start="$start"
+        	uci commit ipsecStatus
+		else
+			start=$( uci -q get ipsecStatus.$1.Connected_Start )
+		fi
+		end=$( date +%s )
+		second=$(( end-start ))	
+		
+		if [ $second -lt 0 ]; then
+			start=$( date +%s )
+			second=0
+			uci set ipsecStatus.$1.Connected_Start="$start"
+			uci set ipsecStatus.$1.Previous_Time="0"
+        	uci commit ipsecStatus
+        	echo "IPSEC Time Error $start $end" > /dev/console 		
+        fi
+		
+		Connected_Time=$((second))
+		connected_count=`uci -q get ipsecStatus.$1.connected_count`
+		if [ $connected_count -gt 0 ]; then
+			previous_time=`uci -q get ipsecStatus.$1.Previous_Time`
+			Total_Time=$((Total_Time+second-previous_time))
+			uci set ipsecStatus.$1.Previous_Time="$second"
+			uci commit ipsecStatus
+		else
+            Total_Time=$((second))
+		fi
+
+		printValue=`printf "%02d:%02d:%02d:%02d\n" $(($Connected_Time/(60*60*24))) $((($Connected_Time%(60*60*24))/(60*60))) $((($Connected_Time%(60*60))/60)) $(($Connected_Time%60))`
+		uci set ipsecStatus.$1.UpTime="$printValue"
+		printValue=`printf "%02d:%02d:%02d:%02d\n" $(($Total_Time/(60*60*24))) $((($Total_Time%(60*60*24))/(60*60))) $((($Total_Time%(60*60))/60)) $(($Total_Time%60))`
+		uci set ipsecStatus.$1.Total_UpTime="$printValue"
+		uci commit ipsecStatus
+		
+		UpTime=$( uci -q get ipsecStatus.$1.UpTime )
+		Total_UpTime=$( uci -q get ipsecStatus.$1.Total_UpTime )
+
+		uci set ipsecStatus.$1.Connected_Time="$Connected_Time"
+		uci set ipsecStatus.$1.Total_Time="$Total_Time"
+		uci commit ipsecStatus
+	else                  
+		uci set ipsecStatus.$1.Previous_Time="0"
+		uci set ipsecStatus.$1.UpTime="00:00:00:00"
+		Total_Time=$( uci -q get ipsecStatus.$1.Total_Time )
+		if [ -z "$Total_Time" ]; then
+        	uci set ipsecStatus.$1.Total_UpTime="00:00:00:00"
+		fi
+        uci set ipsecStatus.$1.Connected_Time="-1"
+        uci commit ipsecStatus
+	fi
+	uptime_connected=0
+}
+
+while true
+do
+	trap 'sigquit' USR1
+
+	fun_kill=$( cat /var/run/charon.pid )
+	[ -z "$fun_kill" ] && debug "### no charon exit." && exit 0
+
+	fun_kill=$( uci show ipsec | grep "enabled='1'" )
+	[ -z "$fun_kill" ] && exit 0
+
+	tunnels=$( uci -q get ipsec.ipsec.tunnels )
+	for tunnel in $tunnels; do
+		tunnel_en=$( uci -q get ipsec.$tunnel.enabled )
+		[ "$tunnel_en" = "0" ] && continue
+		connected_tunnels $tunnel &
+	done
+	sleep 10
+done

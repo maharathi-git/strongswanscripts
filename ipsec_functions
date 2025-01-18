@@ -1,0 +1,398 @@
+#!/bin/bash
+
+. /lib/functions.sh
+
+debug() {
+	echo "##fun: $*" >/dev/console
+}
+
+#####_________________________leds_________________________________#####
+ipsec_led()
+{
+	declare -a tunnels tun_f
+	declare -A intf
+
+	tunnels=( $( uci show ipsecInfo | grep -w "connected='1'" | cut -d '.' -f2 | xargs ) )
+	for tun in ${tunnels[@]}; do
+		tun_f+=( $( uci -q get ipsecInfo."$tun".localinterface ) )
+	done
+	intf["ETH5"]=$(echo "${tun_f[@]}" | grep -o "ETH5" | head -n1 )
+	intf["usb0"]=$(echo "${tun_f[@]}" | grep -o "usb0" | head -n1 )
+	for int in ${!intf[@]}; do
+		if [ "${intf["$int"]}" == "ETH5" ]; then
+			led="led_FE1"
+			led_on="AMBER_ON"
+		elif [ "${intf["$int"]}" == "usb0" ]; then
+			led=$( uci -q get cellularInfo.status.active | cut -c5 | xargs printf "led_SIM%s" $1)
+			led_on="AMBER_ON"
+		else
+			if [ "${!intf}" == "ETH5" ]; then
+				led="led_FE1"
+				led_on="LED_OFF"
+				# is_dhcp=$(  )
+				# [ "$is_dhcp" -gt "0" ] && led_on="GREEN_BLINK" || led_on="LED_OFF"
+			else
+				led=$( uci -q get cellularInfo.status.active | cut -c5 | xargs printf "led_SIM%s" $1)
+				is_dhcp=$( uci -q get.cellularInfo.counters.connection )
+				[ "$is_dhcp" -gt "0" ] && led_on="GREEN_BLINK" || led_on="LED_OFF"
+			fi
+		fi
+		# debug "## led=$led on/off=$led_on"
+		echo "$led_on" > /proc/WiZ_NG/"$led" 2> /dev/null
+	done
+}
+#####_________________________leds_________________________________#####
+
+
+####_________________________tracking_________________________________####
+track_ping() {
+	local dst=$1
+	local src=$2
+	if [ -z "$src" ]; then
+		ping -W 5 -c 1 -s 1 $1 >/dev/null 2>&1
+	else
+		ping -W 5 -c 1 -s 1 $dst -I $src >/dev/null 2>&1 <&1
+	fi
+	ret=$?
+	[ "$ret" = "0" ] && return 0
+	return 1
+}
+
+track() {
+	local tunnel=$1
+	local src
+	local dst
+	local retries
+	local interval
+	local tracking
+	local trackfailure
+	local var1
+	local var2
+	declare -i ping_failed=0
+	while true ##-->
+	do
+		var1=$( cat /var/run/charon.pid )
+		[ -z "$var1" ] && debug "### no charon exit." && exit 0
+
+		var1=$( uci -q get ipsec."$tunnel".enabled )
+		[ "$var1" != "1" ] && exit 0
+
+		var1=$( uci -q get ipsec."$tunnel".tracking_en )
+		[ "$var1" != "1" ] && exit 0
+
+		var1=$( uci -q get ipsec."$tunnel".operation_mode )
+		[ "$var1" = "backup" ] && exit 0
+
+		var1=$( uci -q get ipsec."$tunnel".peer_mode )
+		[ "$var1" = "remote" ] && exit 0
+
+		retries=$( uci -q get ipsec."$tunnel".retries )
+		interval=$( uci -q get ipsec."$tunnel".interval )
+		trackfailure=$( uci -q get ipsec."$tunnel".trackfailure )
+		src=$( uci -q get ipsec."$tunnel".tracksource )
+		dst=$( uci -q get ipsec."$tunnel".trackip )
+
+		var1=$( echo "$src" | grep ":" )
+		var2=$( echo "$src" | grep '.' )
+		[ -z "$var1" ] && [ -z "$var2" ] && {
+			if [[ "$src" = "Any" ]];then
+				ip_flag=$(echo "$dst" | grep ":")
+				[ -n "$ip_flag" ] && ipdest=$(ip route get :: | cut -d ' ' -f5) || ipdest="1.1.1.1"
+				src=$(ip route get "$ipdest" | sed -n '/src/{s/.*src *\([^ ]*\).*/\1/p;q}')
+			else
+				version=$(echo "$src" | grep -o "v6")
+				[ -n "$version" ] && src=$(ifstatus "$src" | jsonfilter -e '@["ipv6-address"][0].address' 2> /dev/null) || \
+					src=$(ifstatus "$src" | jsonfilter -e '@["ipv4-address"][0].address' 2> /dev/null)
+			fi
+		}
+		while true
+		do
+			var1=$( uci get ipsecInfo."$tunnel".connected )
+			if [ "$var1" = "1" ] ; then
+				track_ping $dst $src
+				ret=$?
+				[ $ret -ne 0 ] && track_ping $dst $src && ret=$?
+				[ $ret -ne 0 ] && track_ping $dst $src && ret=$?
+				[ $ret -ne 0 ] && ((++ping_failed)) || ping_failed=0
+				if [ $ping_failed -ge $retries ]; then
+					if [ "$trackfailure" = "restart_conn" ]; then
+						echo "IPsec connection tracking '$tunnel' ping $dst failed, restarting connection." > /dev/console
+						logger -t IPSEC "IPsec connection tracking '$tunnel' ping $dst failed, restarting connection."
+						swanctl -t --ike $tunnel -t -1
+						ping_failed=0
+						break
+					else
+						echo "IPsec connection tracking '$tunnel' ping $dst failed, restarting router." > /dev/console
+						logger -t IPsec "IPsec connection tracking '$tunnel' ping $dst failed, restarting router."
+						reboot
+					fi
+				fi
+			else
+				break
+			fi
+			sleep $interval
+		done
+	done ##-->
+}
+####_________________________tracking_________________________________####
+
+
+###______________________ping ACL____________________________________###
+ping_acl() {
+	local tunnel=$1
+	local ip_flag
+	local src
+	local dst
+	declare -i cnt child_cnt
+	declare -a child_up child_dw subnet_l subnet_r acl acl_l acl_r
+	declare -A childs
+
+	acl_l=( $( uci -q get ipsec."$tunnel".local_acl ) )
+	acl_r=( $( uci -q get ipsec."$tunnel".remote_acl ) )
+	subnet_l=( $(uci -q get ipsec."$tunnel".local_subnet) )
+	subnet_r=( $(uci -q get ipsec."$tunnel".remote_subnet) )
+
+	cnt=0
+	for local_acl in ${acl_l[@]}; do
+		child_cnt=1
+		for src in ${subnet_l[@]}; do
+			for dst in ${subnet_r[@]}; do
+				fl=$( echo "${acl_l[$cnt]}" | grepcidr "$src" )
+				fr=$( echo "${acl_r[$cnt]}" | grepcidr "$dst" )
+				if [ "$fl" == "${acl_l[$cnt]}" ] && [ "$fr" == "${acl_r[$cnt]}" ]; then 
+					childs[child${child_cnt}]="${acl_l[$cnt]} ${acl_r[$cnt]}"
+					((++cnt))
+					break 2
+				fi
+				((++child_cnt))
+			done
+		done
+	done
+
+	while true
+	do
+		ip_flag=$( cat /var/run/charon.pid )
+		[ -z "$ip_flag" ] && debug "### no charon exit." && exit 0
+
+		ip_flag=$( uci -q get ipsec."$tunnel".enabled )
+		[ "$ip_flag" = "0" ] && exit 0
+
+		ip_flag=$( uci -q get ipsec."$tunnel".peer_mode )
+		[ "$ip_flag" = "remote" ] && exit 0
+
+		ip_flag=$( uci -q get ipsecInfo."$tunnel".active )
+		[ "$ip_flag" = "0" ] && continue
+
+		child_up=( $( uci -d $'\n' -q get ipsecInfo."$tunnel".childsa | cut -d '_' -f2 | sort -V ) )
+		child_dw=( $( diff <(echo "${child_up[@]}"| tr ' ' $'\n') <(echo "${!childs[@]}" | tr ' ' $'\n' | sort -V) | sed -n '/^+++/d; /^@@/d; s/.*+/\1/p' ) )
+		for down in ${child_dw[@]};do
+			src=$( echo "${childs[$down]}" | cut -d ' ' -f1 )
+			dst=$( echo "${childs[$down]}" | cut -d ' ' -f2 )
+			ping -c 5 -i 0.2 -s 1 $dst -I $src 2>/dev/null & disown
+		done
+		sleep 10
+	done
+}
+###______________________ping ACL____________________________________###
+
+
+##_______________________pbr rules___________________________________##
+pbr_rules() {
+
+	local local_endpoint="$1"
+	local updown="$2"
+	local tunnel
+	local tunnels
+	local ip_addr
+	local gt_addr
+	local is_up
+	local port
+	local is_v6
+	local on_link
+	local FE0_ifce
+	declare -a rules
+
+	tunnels=$( cat /var/run/charon.pid )
+	[ -z "$tunnels" ] && debug "### no charon exit." && exit 0
+
+	tunnels=$( uci show ipsec | grep "enabled='1'" | cut -d '.' -f2 | xargs )
+	[ -z "$tunnels" ] && debug "### no instances exit." && exit 0
+
+	for tunnel in $tunnels; do
+		rules+=( "$( uci -q get ipsec."$tunnel".local_gateway )" )
+	done
+	on_link=$( echo "${rules[@]}" | tr ' ' $'\n' | sort -d | uniq | grep -ow "$local_endpoint" )
+	[ -z "$on_link" ] && exit 0
+
+	if [[ "$updown" = "DW" ]]; then
+		case $local_endpoint in
+			Cellular | Cellularv6)
+				is_v6=$( echo "$local_endpoint" | grep -o "v6" ) && [ "$is_v6" = "v6" ] && is_v6="-6"
+				ip $is_v6 rule flush table 104 2>/dev/null
+				ip $is_v6 route flush table 104 2>/dev/null
+			;;
+			ETH*)
+				port=$( echo "$local_endpoint" | cut -c4 )
+				port=$(($port-1))
+				is_v6=$( echo "$local_endpoint" | grep -o "v6" ) && [ "$is_v6" = "v6" ] && is_v6="-6"
+				ip $is_v6 rule flush table 10"$port" 2>/dev/null
+				ip $is_v6 route flush table 10"$port" 2>/dev/null
+			;;
+			*) debug "Unknown interface $local_endpoint"
+			;;
+		esac
+	elif [[ "$updown" = "UP" ]]; then
+		case $local_endpoint in
+			Cellularv6)
+				ip -6 rule flush table 104 2> /dev/null
+				ip -6 route flush table 104 2> /dev/null
+
+				is_up=$( ifstatus "${local_endpoint,,}" | jsonfilter -e '@.up' 2>/dev/null )
+				[ "$is_up" = "true" ] && \
+				ip_addr=$( ifstatus "${local_endpoint,,}"v6 | jsonfilter -e '@["ipv6-address"][0].address' 2>/dev/null ) && \
+				gt_addr=$( uci -q get routing_status.cellular_route.cellularv6gw )
+
+				[ -n "$ip_addr" ] && ip -6 rule add from "$ip_addr" table 104 priority 104 2>/dev/null
+				[ -n "$gt_addr" ] && ip -6 route add default dev usb0 via "$gt_addr" table 104 2>/dev/null
+				# debug "PBR on $local_endpoint $ip_addr $gt_addr"
+			;;
+			Cellular)
+				ip rule flush table 104 2> /dev/null
+				ip route flush table 104 2> /dev/null
+
+				is_up=$( ifstatus "${local_endpoint,,}" | jsonfilter -e '@.up' 2>/dev/null )
+				[ "$is_up" = "true" ] && \
+				ip_addr=$( ifstatus "${local_endpoint,,}" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null )
+				[ -n "$ip_addr" ] && \
+				ip rule add from "$ip_addr" table 104 priority 104 2>/dev/null && \
+				ip route add default dev usb0 table 104 2>/dev/null
+				# debug "PBR on $local_endpoint $ip_addr $gt_addr"
+			;;				
+			ETH*)
+				port=$( echo "$local_endpoint" | cut -c4 )
+				port=$(($port-1))
+				[ "$port" = "4" ] && exit 0
+				is_v6=$( echo "$local_endpoint" | grep -o "v6" ) && [ "$is_v6" = "v6" ] && is_v6="-6"
+
+				ip $is_v6 rule flush table 10"$port" 2> /dev/null
+				ip $is_v6 route flush table 10"$port" 2> /dev/null
+
+				if [[ "$is_v6" = "-6" ]]; then
+					ip_addr=$( ifstatus "$local_endpoint" | jsonfilter -e '@["ipv6-address"][0].address' 2>/dev/null ) 
+					gt_addr=$( ifstatus "$local_endpoint" | jsonfilter -e '@["route"][0].nexthop' 2>/dev/null )
+				else
+					gt_addr=$( ifstatus "$local_endpoint" | jsonfilter -e '@["route"][0].nexthop' 2>/dev/null )
+					ip_addr=$( ifstatus "$local_endpoint" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null )
+				fi
+				#pending for PPPoE
+				[ -n "$ip_addr" ] && ip $is_v6 rule add from "$ip_addr" table 10"$port" priority "$port" 2>/dev/null
+				[ -n "$gt_addr" ] && ip $is_v6 route add default via "$gt_addr" dev lan$port table 10"$port" 2>/dev/null
+				# debug "PBR on $local_endpoint $ip_addr $gt_addr lan$port"
+			;;
+			*)  debug "Unknown interface $local_endpoint"
+				exit 0
+			;;
+		esac
+	fi
+	uci set ipsecInfo.reload=1
+	uci commit ipsecInfo
+}
+
+pbrrules_forall(){
+
+	local intf
+	declare -a local_endpoints
+	declare -a tunnels
+
+	local_endpoints=( $( uci show ipsec | grep "enabled='1'" | cut -d '.' -f2) )
+	for intf in ${local_endpoints[@]}; do
+		tunnels+=( $( uci -q get ipsec."$intf".local_gateway ) )
+	done
+	unset local_endpoints
+	local_endpoints+=( $( echo "${tunnels[@]}"  | tr ' ' $'\n' | grep "Cellular\\|ETH" | sort -d | uniq ) )
+	for intf in ${local_endpoints[@]}; do
+		pbr_rules $intf UP 2>/dev/null & disown
+	done
+}
+##_______________________pbr rules___________________________________##
+
+
+#_______________________main backup______________________________#
+shift_tunnel() {
+	local updown=$1
+	local main_tunnel=$2
+	local tunnels
+	local backup_tunnel
+	local active
+
+	if [ "$updown" = "UP" ]; then
+		backup_tunnel=$( uci show ipsec | grep -w 'backup_reference' | grep -w "$main_tunnel" | cut -d '.' -f2 )
+		[ -z "$backup_tunnel" ] && return
+		active=$( uci -q get ipsecInfo."$backup_tunnel".active )
+		[ "$active" = "1" ] && return
+		uci set ipsecInfo."$backup_tunnel".active=1
+		uci commit ipsecInfo
+		echo "TunnelShift: main tunnel($main_tunnel) is down, start backup tunnel($backup_tunnel)" > /dev/console
+		logger -t IPSEC "TunnelShift: main tunnel($main_tunnel) is down, start backup tunnel($backup_tunnel)."
+		uci set ipsecInfo.reload=1
+		uci commit ipsecInfo
+	elif [ "$updown" = "DW" ]; then
+		active=$( uci -q get ipsecInfo."$main_tunnel".active )
+		[ "$active" = "0" ] && return
+		uci set ipsecInfo."$main_tunnel".active=0
+		uci commit ipsecInfo
+		backup_tunnel=$( uci -q get ipsec."$main_tunnel".backup_reference )
+		echo "TunnelShift: main tunnel($backup_tunnel) is up, remove backup tunnel($main_tunnel)" > /dev/console
+		logger -t IPSEC "TunnelShift: main tunnel($backup_tunnel) is up, remove backup tunnel($main_tunnel)."
+		
+		/etc/init.d/swanctl reload
+		debug "terminating $main_tunnel" && swanctl -t --ike "$main_tunnel" --force -t -1 #2>/dev/null
+	else
+		logger -t IPSEC "TunnelShift: Unknown action in function ipsec_functions/main_backup."
+	fi
+}
+
+main_failure() {
+
+	local tunnel
+	local is_tun_up
+	local backup_tunnels
+	local main_tunnel
+	local pid
+	declare -i cnt=5
+	declare -A open_backup
+
+	tunnel=$( cat /var/run/charon.pid )
+	[ -z "$tunnel" ] && debug "### no charon exit." && exit 0
+
+	while [ $cnt -ne 0 ]
+	do
+		backup_tunnels=$( uci -q show ipsec | grep -w 'backup_reference' |cut -d '.' -f2 | tr $'\n' $'\t' )
+		[ -z "$backup_tunnels" ] && exit 0
+		for tunnel in $backup_tunnels; do
+			#is main open
+			main_tunnel=$( uci -q get ipsec."$tunnel".backup_reference )
+			[ -z "$main_tunnel" ] && continue
+			is_tun_up=$( uci -q get ipsecInfo."$main_tunnel".connected )
+			# debug "is main=$main_tunnel up=$is_tun_up"
+			[ "$is_tun_up" = "1" ] && continue
+			# is backup open
+			is_tun_up=$( uci -q get ipsecInfo."$tunnel".connected )
+			# debug "is backup=$tunnel up=$is_tun_up"
+			[ "$is_tun_up" = "1" ] && continue
+			open_backup["$main_tunnel"]="1"
+			# debug "main=$main_tunnel backup=$tunnel ${open_backup[$main_tunnel]} $cnt"
+		done
+		((--cnt))
+		sleep 5
+	done
+
+	for tunnel in ${!open_backup[@]}; do
+		[ "${open_backup[$tunnel]}" = "1" ] && shift_tunnel "UP" "$tunnel" 2>/dev/null >/dev/null & disown && debug "shift_tunnel "UP" $tunnel 0<&- &>/dev/null &"
+	done
+}
+#_______________________main backup______________________________#
+
+exec_function="$1 $2 $3"
+
+eval "$exec_function" 2>/dev/null >/dev/null & disown

@@ -1,0 +1,76 @@
+#!/bin/bash
+
+. /lib/functions.sh
+
+debug () {
+	echo "##start : $*" > /dev/console
+}
+
+ping_all() {
+	local tunnels
+	local tunnel
+	tunnels=$( uci show ipsec | grep "enabled='1'" | cut -d '.' -f2 )
+	[ -z "$tunnels" ] && exit 0
+	for tunnel in $tunnels; do
+		/etc/swanctl/ipsec_functions ping_acl "$tunnel" 2>/dev/null & disown
+		sleep 0.5
+	done
+}
+
+track_all() {
+	local tunnels
+	local tunnel
+	tunnels=$( uci show ipsec | grep "tracking_en='1'" | cut -d '.' -f2 )
+	for tunnel in $tunnels; do
+		/etc/swanctl/ipsec_functions track $tunnel & disown
+		sleep 0.5
+	done
+}
+
+debug "started"
+
+create=$( uci -q -p /etc/config/ show ipsec )
+if [[ -z "$create" ]]; then 
+	touch /etc/config/ipsec
+fi
+
+tunnels=$( uci -q get ipsec.ipsec.tunnels )
+echo "" > /etc/config/ipsecInfo
+for tunnel in $tunnels; do
+	uci set ipsecInfo."$tunnel"=status
+	operation_mode=$( uci -q get ipsec."$tunnel".operation_mode )
+	if [[ "$operation_mode" = "main" ]]; then
+	 	uci set ipsecInfo."$tunnel".active=1
+	else
+	 	uci set ipsecInfo."$tunnel".active=0
+	fi
+done
+uci commit ipsecInfo
+
+echo "" > /etc/config/ipsecStatus
+for tunnel in $tunnels; do
+	uci set ipsecStatus."$tunnel"=status
+done
+uci commit ipsecStatus
+
+[ -z "$tunnels" ] && debug "no IPsec instances stop charon and exit." && /etc/init.d/swanctl stop && exit 0
+
+/etc/init.d/swanctl reload
+
+debug "apply pbr rules for all..."
+/etc/swanctl/ipsec_functions pbrrules_forall & disown
+
+ping_all & disown
+
+track_all & disown
+
+debug "calling main_failure function..."
+sleep 90
+/etc/swanctl/ipsec_functions main_failure & disown
+
+procd_open_instance 
+procd_set_param command /etc/swanctl/ipsec_reload
+procd_set_param respawn
+procd_close_instance
+
+debug "finished"
